@@ -12,9 +12,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".podcast-to-notes"
@@ -147,6 +149,47 @@ def stage_download(url, work_dir):
     return candidates[0]
 
 
+def stage_local_audio(audio_file, work_dir):
+    """Copy a local audio file into work_dir and generate basic metadata."""
+    src = Path(audio_file)
+    if not src.is_file():
+        sys.exit(f"❌ Audio file not found: {src}")
+
+    dest = work_dir / f"audio{src.suffix}"
+    if not dest.exists() or dest.stat().st_size != src.stat().st_size:
+        shutil.copy2(src, dest)
+
+    # Build metadata with sensible defaults
+    duration = 0
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(src)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if probe.returncode == 0:
+            fmt = json.loads(probe.stdout).get("format", {})
+            duration = int(float(fmt.get("duration", 0)))
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    meta = {
+        "title": src.stem,
+        "uploader": "local",
+        "upload_date": date.today().strftime("%Y%m%d"),
+        "duration": duration,
+        "webpage_url": str(src.absolute()),
+        "description": "",
+    }
+    meta_file = work_dir / "metadata.json"
+    if not meta_file.exists():
+        meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+    else:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+
+    return dest, meta
+
+
 # ==================== Stage 2: Transcribe ====================
 
 # Supported languages — we only optimize for these two.
@@ -168,7 +211,7 @@ def _normalize_language(raw):
     return s  # return raw normalized for diagnostics; caller decides what to do
 
 
-def stage_transcribe(audio_path, work_dir, config):
+def stage_transcribe(audio_path, work_dir, config, model_size="large-v3-turbo"):
     """Returns (segments, detected_language). Segments: [{start, end, text, speaker?}]."""
     segments_file = work_dir / "segments.json"
     lang_file = work_dir / "language.txt"
@@ -187,12 +230,13 @@ def stage_transcribe(audio_path, work_dir, config):
     if btype == "cloud":
         segments, detected = _transcribe_cloud(audio_path, provider)
     elif provider == "mlx":
-        segments, detected = _transcribe_mlx(audio_path)
+        segments, detected = _transcribe_mlx(audio_path, model_size=model_size)
     elif provider == "whisperx":
-        segments, detected = _transcribe_whisperx(audio_path)
+        segments, detected = _transcribe_whisperx(audio_path, model_size=model_size)
     elif provider in ("faster_whisper_cuda", "faster_whisper_cpu"):
         segments, detected = _transcribe_faster_whisper(
-            audio_path, use_cuda=(provider == "faster_whisper_cuda"))
+            audio_path, use_cuda=(provider == "faster_whisper_cuda"),
+            model_size=model_size)
     else:
         raise RuntimeError(f"Unknown backend: {provider}")
 
@@ -351,17 +395,17 @@ def _find_local_mlx_whisper_model():
     return None
 
 
-def _transcribe_mlx(audio_path):
+def _transcribe_mlx(audio_path, model_size="large-v3-turbo"):
     """MLX Whisper. Auto-detects language. Uses any locally-cached model
-    before falling back to downloading turbo."""
+    before falling back to downloading the specified model size."""
     import mlx_whisper
     local_model = _find_local_mlx_whisper_model()
     if local_model:
         print(f"   Using cached MLX model: {Path(local_model).parent.parent.name}")
         model_id = local_model
     else:
-        print(f"   No cached MLX model found; will download mlx-community/whisper-large-v3-turbo")
-        model_id = "mlx-community/whisper-large-v3-turbo"
+        model_id = f"mlx-community/whisper-{model_size}"
+        print(f"   No cached MLX model found; will download {model_id}")
 
     print("   Loading MLX Whisper (auto-detecting language)...")
     result = mlx_whisper.transcribe(
@@ -379,13 +423,13 @@ def _transcribe_mlx(audio_path):
     return segments, detected
 
 
-def _transcribe_whisperx(audio_path):
+def _transcribe_whisperx(audio_path, model_size="large-v3-turbo"):
     """WhisperX with auto language detection."""
     import whisperx
     device = "cuda"
-    print("   Loading WhisperX (auto-detecting language)...")
+    print(f"   Loading WhisperX model '{model_size}' (auto-detecting language)...")
     # No language param at model load → auto-detect.
-    model = whisperx.load_model("large-v3-turbo", device,
+    model = whisperx.load_model(model_size, device,
                                  compute_type="float16")
     audio = whisperx.load_audio(str(audio_path))
     result = model.transcribe(audio, batch_size=16)
@@ -417,13 +461,13 @@ def _transcribe_whisperx(audio_path):
     return segments, detected
 
 
-def _transcribe_faster_whisper(audio_path, use_cuda):
+def _transcribe_faster_whisper(audio_path, use_cuda, model_size="large-v3-turbo"):
     """faster-whisper with auto language detection."""
     from faster_whisper import WhisperModel
     device = "cuda" if use_cuda else "cpu"
     compute = "float16" if use_cuda else "int8"
-    print(f"   Loading faster-whisper ({device}, auto-detecting language)...")
-    model = WhisperModel("large-v3-turbo", device=device, compute_type=compute)
+    print(f"   Loading faster-whisper '{model_size}' ({device}, auto-detecting language)...")
+    model = WhisperModel(model_size, device=device, compute_type=compute)
     # No language param → auto-detect.
     segs, info = model.transcribe(str(audio_path), beam_size=5)
     detected = getattr(info, "language", "en") or "en"
@@ -480,11 +524,13 @@ def write_full_transcript(segments, work_dir):
     return path
 
 
-def chunk_segments(segments):
+def chunk_segments(segments, chunk_target_tokens=None):
     """
     If transcript fits under threshold, return single chunk.
     Otherwise split at natural boundaries (~30-45 min) with overlap.
     """
+    if chunk_target_tokens is None:
+        chunk_target_tokens = CHUNK_TARGET_TOKENS
     full_text = "\n".join(format_segment(s) for s in segments)
     total_tokens = estimate_tokens(full_text)
 
@@ -498,7 +544,7 @@ def chunk_segments(segments):
             "is_overlap_extension": False,
         }]
 
-    # Need to split. Aim for CHUNK_TARGET_TOKENS per chunk, with OVERLAP_SECONDS overlap.
+    # Need to split. Aim for chunk_target_tokens per chunk, with OVERLAP_SECONDS overlap.
     chunks = []
     chunk_idx = 0
     chunk_segs = []
@@ -511,7 +557,7 @@ def chunk_segments(segments):
         seg_tokens = estimate_tokens(seg_text)
 
         # Will adding this segment overshoot? If so, finalize current chunk.
-        if chunk_tokens + seg_tokens > CHUNK_TARGET_TOKENS and chunk_segs:
+        if chunk_tokens + seg_tokens > chunk_target_tokens and chunk_segs:
             # Determine overlap region: include segments from last (OVERLAP_SECONDS)
             chunk_end_time = chunk_segs[-1]["end"]
             chunk_start_time = chunk_segs[0]["start"]
@@ -563,9 +609,18 @@ def chunk_segments(segments):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url", help="Podcast/YouTube URL")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("url", nargs="?", default=None, help="Podcast/YouTube URL")
+    source.add_argument("--audio-file", help="Path to a local audio file (skips download)")
     parser.add_argument("--output-dir", default="./podcast_output")
+    parser.add_argument("--model-size", default="large-v3-turbo",
+                        help="Whisper model size for local backends (default: large-v3-turbo)")
+    parser.add_argument("--chunk-target", type=int, default=CHUNK_TARGET_TOKENS,
+                        help=f"Target tokens per chunk (default: {CHUNK_TARGET_TOKENS})")
     args = parser.parse_args()
+
+    if not args.url and not args.audio_file:
+        parser.error("Either a URL or --audio-file is required.")
 
     load_env_into_environ()
     config = load_config()
@@ -575,29 +630,40 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Each URL gets a deterministic work dir (resumable)
-    url_hash = hashlib.sha256(args.url.encode()).hexdigest()[:10]
+    # Each input gets a deterministic work dir (resumable)
+    source_key = args.url or str(Path(args.audio_file).absolute())
+    url_hash = hashlib.sha256(source_key.encode()).hexdigest()[:10]
     work_dir = output_dir / f"work_{url_hash}"
     work_dir.mkdir(exist_ok=True)
     (work_dir / "chunks").mkdir(exist_ok=True)
 
+    display_name = args.url[:60] if args.url else Path(args.audio_file).name
     print(f"\n{'=' * 64}")
-    print(f"  Preparing: {args.url[:60]}")
+    print(f"  Preparing: {display_name}")
     print(f"{'=' * 64}\n")
     t0 = time.time()
 
-    print("📥 Fetching metadata...")
-    metadata = stage_metadata(args.url, work_dir)
-    print(f"   Title: {(metadata.get('title') or '?')[:60]}")
-    print(f"   Duration: {metadata.get('duration', 0)}s")
+    if args.audio_file:
+        print("📂 Using local audio file...")
+        audio_path, metadata = stage_local_audio(args.audio_file, work_dir)
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        print(f"   Title: {(metadata.get('title') or '?')[:60]}")
+        print(f"   Duration: {metadata.get('duration', 0)}s")
+        print(f"   ✓ {audio_path.name} ({size_mb:.1f} MB)")
+    else:
+        print("📥 Fetching metadata...")
+        metadata = stage_metadata(args.url, work_dir)
+        print(f"   Title: {(metadata.get('title') or '?')[:60]}")
+        print(f"   Duration: {metadata.get('duration', 0)}s")
 
-    print("\n🎵 Downloading audio...")
-    audio_path = stage_download(args.url, work_dir)
-    size_mb = audio_path.stat().st_size / 1024 / 1024
-    print(f"   ✓ {audio_path.name} ({size_mb:.1f} MB)")
+        print("\n🎵 Downloading audio...")
+        audio_path = stage_download(args.url, work_dir)
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        print(f"   ✓ {audio_path.name} ({size_mb:.1f} MB)")
 
     print("\n🎙️ Transcribing...")
-    segments, detected_lang = stage_transcribe(audio_path, work_dir, config)
+    segments, detected_lang = stage_transcribe(audio_path, work_dir, config,
+                                                model_size=args.model_size)
     print(f"   ✓ {len(segments)} segments, language={detected_lang}")
 
     print("\n📝 Writing full transcript...")
@@ -606,7 +672,7 @@ def main():
     print(f"   ✓ {full_tokens:,} estimated tokens")
 
     print("\n✂️ Chunking...")
-    chunks = chunk_segments(segments)
+    chunks = chunk_segments(segments, chunk_target_tokens=args.chunk_target)
     if len(chunks) == 1:
         print(f"   Single chunk (under {LONG_THRESHOLD_TOKENS:,} token threshold)")
     else:
@@ -626,14 +692,14 @@ def main():
 
     metadata["audio_path"] = str(audio_path.absolute())
     metadata["audio_filename"] = audio_path.name
-    metadata["webpage_url"] = metadata.get("webpage_url", args.url)
+    metadata["webpage_url"] = metadata.get("webpage_url", args.url or str(Path(args.audio_file).absolute()))
 
     # Default output_language tracks the spoken language unless agent overrides.
     # If transcript is in Chinese, output Chinese notes; if English, English.
     output_language = "中文" if detected_lang == "zh" else "English"
 
     prep = {
-        "url": args.url,
+        "url": args.url or str(Path(args.audio_file).absolute()),
         "metadata": metadata,
         "transcript_language": detected_lang,
         "output_language": output_language,
@@ -643,7 +709,7 @@ def main():
         "is_long_episode": len(chunks) > 1,
         "thresholds": {
             "long_episode_tokens": LONG_THRESHOLD_TOKENS,
-            "chunk_target_tokens": CHUNK_TARGET_TOKENS,
+            "chunk_target_tokens": args.chunk_target,
             "overlap_seconds": OVERLAP_SECONDS,
         },
         "work_dir": str(work_dir.absolute()),

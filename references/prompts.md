@@ -45,32 +45,50 @@ Do not include any extra text or markdown wrappers around the JSON.
 - Output language: {output_language}
 - Chunk: {chunk_info}
 
-# Output JSON schema (strict)
+# Output JSON schema (strict — see references/pass1_schema.json for formal definition)
+
+<!-- The authoritative schema lives at references/pass1_schema.json.
+     The render.py validator checks against it via jsonschema (with manual fallback).
+     The inline version below is for the LLM's context window. Keep them in sync. -->
 
 {
-  "tldr": "3-sentence summary in {output_language}, capturing the most important judgments. NOT a flow narrative — a take.",
+  // 3-sentence summary — a take, NOT a flow narrative. Written in {output_language}.
+  "tldr": "string (required)",
+
+  // 5-12 sections. Every timestamp must come from the transcript.
   "outline": [
     {
-      "section": "Section title in {output_language}. MUST start with a verb. e.g. '拆解 Transformer 注意力机制' / 'Unpack the Transformer attention mechanism', NOT '关于 Transformer' / 'About Transformers'",
-      "timestamp": "HH:MM:SS or MM:SS — start time from the transcript",
-      "key_points": ["one-sentence point in {output_language}", "..."],
-      "worth_listening": true,
-      "skip_reason": "if worth_listening is false: why (in {output_language}). Otherwise empty string."
+      "section": "string (required) — verb-first title in {output_language}. e.g. '拆解 Transformer 注意力机制' / 'Unpack the Transformer attention mechanism', NOT '关于 Transformer'",
+      "timestamp": "string — HH:MM:SS or MM:SS, start time from the transcript",
+      "key_points": ["string (required, ≥1 item) — one-sentence points in {output_language}"],
+      "worth_listening": true,   // boolean, default true. false for ads/intros/off-topic.
+      "skip_reason": ""          // string — why to skip (in {output_language}), or empty string
     }
   ],
+
+  // 3-7 top-level branches, each with 2-5 children. Every leaf has a timestamp.
   "mindmap": {
-    "root": "Central topic in {output_language} (concise)",
+    "root": "string (required) — central topic in {output_language} (concise)",
     "branches": [
       {
-        "label": "Branch label in {output_language} (short — ≤8 Chinese chars or ≤4 English words)",
+        "label": "string (required) — ≤8 Chinese chars or ≤4 English words",
         "children": [
-          { "label": "Sub-point in {output_language}", "timestamp": "MM:SS" }
+          {
+            "label": "string (required) — sub-point in {output_language}",
+            "timestamp": "string — MM:SS"
+          }
         ]
       }
     ]
   },
+
+  // Only LOAD-BEARING terms. The "term" field keeps original wording — never translate it.
   "key_terms": [
-    { "term": "Original term, do NOT translate this field", "translation": "translation in {output_language}", "explanation": "one sentence in {output_language} explaining why it matters in this episode" }
+    {
+      "term": "string (required) — original term, do NOT translate",
+      "translation": "string — translation in {output_language}",
+      "explanation": "string — one sentence in {output_language}, why it matters here"
+    }
   ]
 }
 

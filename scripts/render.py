@@ -1195,12 +1195,46 @@ def slugify(s, max_len=60):
     return s[:max_len].strip("-") or "untitled"
 
 
-def validate_outline(outline, source_path):
-    """Validate outline.json structure before rendering.
+def _load_pass1_schema():
+    """Load the JSON Schema file from references/pass1_schema.json."""
+    schema_path = Path(__file__).resolve().parent.parent / "references" / "pass1_schema.json"
+    if schema_path.exists():
+        return json.loads(schema_path.read_text(encoding="utf-8"))
+    return None
 
-    Checks required top-level keys, types, and nested fields.
-    Prints a clear error and exits if validation fails.
-    """
+
+def _validate_outline_jsonschema(outline, source_path):
+    """Validate using jsonschema library. Returns True if validation ran, False if unavailable."""
+    try:
+        import jsonschema
+    except ImportError:
+        return False
+
+    schema = _load_pass1_schema()
+    if schema is None:
+        print("WARNING: references/pass1_schema.json not found, "
+              "falling back to manual validation.", file=sys.stderr)
+        return False
+
+    validator = jsonschema.Draft7Validator(schema)
+    errors = sorted(validator.iter_errors(outline), key=lambda e: list(e.absolute_path))
+
+    if not errors:
+        return True
+
+    print(f"ERROR: outline.json validation failed ({source_path}):",
+          file=sys.stderr)
+    for err in errors:
+        path = ".".join(str(p) for p in err.absolute_path) or "(root)"
+        print(f"  - {path}: {err.message}", file=sys.stderr)
+    print("\nThe LLM-generated outline.json is malformed. "
+          "Please re-run Step 3 (LLM analysis) to regenerate it.",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+def _validate_outline_manual(outline, source_path):
+    """Fallback manual validation when jsonschema is not installed."""
     errors = []
 
     # 1. Required top-level keys
@@ -1250,6 +1284,16 @@ def validate_outline(outline, source_path):
               "Please re-run Step 3 (LLM analysis) to regenerate it.",
               file=sys.stderr)
         sys.exit(1)
+
+
+def validate_outline(outline, source_path):
+    """Validate outline.json structure before rendering.
+
+    Uses jsonschema validation against references/pass1_schema.json when
+    the jsonschema package is available; falls back to manual checks otherwise.
+    """
+    if not _validate_outline_jsonschema(outline, source_path):
+        _validate_outline_manual(outline, source_path)
 
 
 def main():
