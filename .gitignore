@@ -1,1 +1,35 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+
+# Output directories
+podcast_output/
+
+# Temporary files
+*.tmp
+*.swp

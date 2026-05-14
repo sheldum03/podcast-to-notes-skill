@@ -124,24 +124,20 @@ def stage_download(url, work_dir):
         return existing[0]
 
     print(f"   Downloading audio...")
+    # Let stdout pass through so yt-dlp's native progress bar is visible.
+    # Only capture stderr for error detection.
     result = subprocess.run(
         ["yt-dlp",
          "-x", "--audio-format", "m4a", "--audio-quality", "0",
          "--no-playlist",
          "-o", str(work_dir / "audio.%(ext)s"),
-         "--print", "after_move:filepath",
          url],
-        capture_output=True, text=True, timeout=900,
+        stderr=subprocess.PIPE, text=True, timeout=900,
     )
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed:\n{result.stderr[-500:]}")
 
-    # yt-dlp prints the final filepath when --print after_move:filepath used
-    printed_path = result.stdout.strip().split("\n")[-1] if result.stdout else ""
-    if printed_path and Path(printed_path).exists():
-        return Path(printed_path)
-
-    # Fallback: find by extension
+    # Find downloaded file by extension
     candidates = [p for p in work_dir.iterdir()
                   if p.is_file() and p.suffix in audio_exts and p.stem.startswith("audio")]
     if not candidates:
