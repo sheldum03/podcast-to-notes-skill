@@ -81,6 +81,33 @@ def estimate_tokens(text):
     return int(cjk_chars / 1.5 + latin_chars / 4)
 
 
+# ==================== Audio validation ====================
+
+def validate_audio_file(audio_path):
+    """Verify audio file is playable via ffprobe. Returns True if valid.
+    Exits with error if file is missing or corrupt. Gracefully degrades if ffprobe is unavailable."""
+    audio_path = Path(audio_path)
+    if not audio_path.is_file():
+        print(f"ERROR: Audio file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", str(audio_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"ERROR: Audio file is not playable: {audio_path}", file=sys.stderr)
+            print(f"  ffprobe: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        return True
+    except FileNotFoundError:
+        print("   ⚠️ ffprobe not found — skipping audio format validation", file=sys.stderr)
+        return True
+    except subprocess.TimeoutExpired:
+        print("   ⚠️ ffprobe timed out — skipping audio format validation", file=sys.stderr)
+        return True
+
+
 # ==================== Stage 1: Metadata + Download ====================
 
 def stage_metadata(url, work_dir):
@@ -656,6 +683,9 @@ def main():
         audio_path = stage_download(args.url, work_dir)
         size_mb = audio_path.stat().st_size / 1024 / 1024
         print(f"   ✓ {audio_path.name} ({size_mb:.1f} MB)")
+
+    print("\n🔍 Validating audio format...")
+    validate_audio_file(audio_path)
 
     print("\n🎙️ Transcribing...")
     segments, detected_lang = stage_transcribe(audio_path, work_dir, config,

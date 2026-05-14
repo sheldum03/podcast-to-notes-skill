@@ -14,8 +14,9 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import pytest
-from prepare import estimate_tokens, _cjk_ratio, chunk_segments, format_segment, fmt_timestamp
-from render import validate_outline, ts_to_seconds, fmt_date, detect_language
+from unittest.mock import patch
+from prepare import estimate_tokens, _cjk_ratio, chunk_segments, format_segment, fmt_timestamp, validate_audio_file
+from render import validate_outline, validate_inputs, validate_timestamps, ts_to_seconds, fmt_date, detect_language
 
 
 # ==================== estimate_tokens ====================
@@ -244,3 +245,192 @@ class TestFmtTimestamp:
 
     def test_zero(self):
         assert fmt_timestamp(0) == "00:00"
+
+
+# ==================== P0: validate_inputs (render.py) ====================
+
+class TestValidateInputs:
+    """render.py must check that outline.json and insights.md exist before rendering."""
+
+    def test_all_files_exist(self, tmp_path):
+        prep = tmp_path / "prep.json"
+        outline = tmp_path / "outline.json"
+        insights = tmp_path / "insights.md"
+        prep.write_text("{}")
+        outline.write_text("{}")
+        insights.write_text("# test")
+        # Should not raise
+        validate_inputs(str(prep), str(outline), str(insights))
+
+    def test_missing_outline(self, tmp_path):
+        prep = tmp_path / "prep.json"
+        insights = tmp_path / "insights.md"
+        prep.write_text("{}")
+        insights.write_text("# test")
+        with pytest.raises(SystemExit):
+            validate_inputs(str(prep), str(tmp_path / "outline.json"), str(insights))
+
+    def test_missing_insights(self, tmp_path):
+        prep = tmp_path / "prep.json"
+        outline = tmp_path / "outline.json"
+        prep.write_text("{}")
+        outline.write_text("{}")
+        with pytest.raises(SystemExit):
+            validate_inputs(str(prep), str(outline), str(tmp_path / "insights.md"))
+
+    def test_missing_prep(self, tmp_path):
+        outline = tmp_path / "outline.json"
+        insights = tmp_path / "insights.md"
+        outline.write_text("{}")
+        insights.write_text("# test")
+        with pytest.raises(SystemExit):
+            validate_inputs(str(tmp_path / "prep.json"), str(outline), str(insights))
+
+    def test_error_message_includes_filename(self, tmp_path, capsys):
+        prep = tmp_path / "prep.json"
+        prep.write_text("{}")
+        outline_path = str(tmp_path / "outline.json")
+        with pytest.raises(SystemExit):
+            validate_inputs(str(prep), outline_path, str(tmp_path / "insights.md"))
+        captured = capsys.readouterr()
+        assert "outline.json" in captured.err
+
+
+# ==================== P1a: validate_timestamps (render.py) ====================
+
+class TestValidateTimestamps:
+    """Timestamps in outline.json must not exceed audio duration."""
+
+    def _outline_with_timestamps(self, *timestamps):
+        return {
+            "tldr": "summary",
+            "outline": [
+                {"section": f"Section {i+1}", "key_points": ["pt"],
+                 "timestamp": ts}
+                for i, ts in enumerate(timestamps)
+            ],
+            "mindmap": {"root": "Topic", "branches": []},
+            "key_terms": [],
+        }
+
+    def test_valid_timestamps_no_warning(self, capsys):
+        outline = self._outline_with_timestamps("05:00", "20:00", "40:00")
+        warnings = validate_timestamps(outline, duration=2700)  # 45 min
+        assert len(warnings) == 0
+
+    def test_timestamp_exceeds_duration(self):
+        outline = self._outline_with_timestamps("05:00", "01:30:00")  # 90 min
+        warnings = validate_timestamps(outline, duration=2700)  # 45 min
+        assert len(warnings) > 0
+        assert "01:30:00" in warnings[0]
+
+    def test_no_duration_skips_validation(self):
+        outline = self._outline_with_timestamps("99:99:99")
+        warnings = validate_timestamps(outline, duration=0)
+        assert len(warnings) == 0
+
+    def test_mindmap_timestamps_checked(self):
+        outline = {
+            "tldr": "summary",
+            "outline": [],
+            "mindmap": {
+                "root": "Topic",
+                "branches": [
+                    {"label": "B1", "children": [
+                        {"label": "child", "timestamp": "02:00:00"}
+                    ]}
+                ]
+            },
+            "key_terms": [],
+        }
+        warnings = validate_timestamps(outline, duration=1800)  # 30 min
+        assert len(warnings) > 0
+
+    def test_multiple_bad_timestamps(self):
+        outline = self._outline_with_timestamps("50:00", "55:00")
+        warnings = validate_timestamps(outline, duration=2400)  # 40 min
+        assert len(warnings) == 2
+
+
+# ==================== P1b: validate_audio_file (prepare.py) ====================
+
+class TestValidateAudioFile:
+    """Audio files must be verified as playable via ffprobe before transcription."""
+
+    def test_valid_audio_returns_true(self, tmp_path):
+        audio = tmp_path / "audio.m4a"
+        audio.write_bytes(b"\x00" * 2048)
+        with patch("prepare.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = '{"format": {"duration": "120.5"}}'
+            assert validate_audio_file(audio) is True
+
+    def test_invalid_audio_raises(self, tmp_path):
+        audio = tmp_path / "audio.m4a"
+        audio.write_bytes(b"\x00" * 2048)
+        with patch("prepare.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stderr = "Invalid data found"
+            with pytest.raises(SystemExit):
+                validate_audio_file(audio)
+
+    def test_ffprobe_not_found_warns(self, tmp_path, capsys):
+        audio = tmp_path / "audio.m4a"
+        audio.write_bytes(b"\x00" * 2048)
+        with patch("prepare.subprocess.run", side_effect=FileNotFoundError):
+            # Should not raise — graceful degradation when ffprobe missing
+            result = validate_audio_file(audio)
+            assert result is True  # proceed without validation
+        captured = capsys.readouterr()
+        assert "ffprobe" in captured.out.lower() or "ffprobe" in captured.err.lower()
+
+    def test_nonexistent_file_raises(self, tmp_path):
+        with pytest.raises(SystemExit):
+            validate_audio_file(tmp_path / "nonexistent.m4a")
+
+
+# ==================== P2: --audio-url in render.py ====================
+
+class TestAudioUrl:
+    """--audio-url should override local audio path in HTML output."""
+
+    def _make_inputs(self, tmp_path):
+        prep = {
+            "metadata": {
+                "title": "Test Episode",
+                "uploader": "Test",
+                "upload_date": "20240101",
+                "duration": 1800,
+                "audio_path": "/tmp/audio.m4a",
+                "audio_filename": "audio.m4a",
+                "webpage_url": "https://example.com/ep1",
+            },
+            "url": "https://example.com/ep1",
+        }
+        outline = {
+            "tldr": "A test summary",
+            "outline": [
+                {"section": "Intro", "key_points": ["point 1"], "timestamp": "00:00",
+                 "worth_listening": True},
+            ],
+            "mindmap": {"root": "Topic", "branches": []},
+            "key_terms": [],
+        }
+        insights = "## Quotes\n> Some quote\n"
+        return prep, outline, insights
+
+    def test_audio_url_used_in_html_simple(self):
+        from render import render_html_simple
+        prep, outline, insights = self._make_inputs(None)
+        audio_url = "https://cdn.example.com/episode1.mp3"
+        html = render_html_simple(prep["metadata"], outline, insights,
+                                   audio_url, prep["metadata"]["webpage_url"])
+        assert "https://cdn.example.com/episode1.mp3" in html
+
+    def test_audio_url_used_in_html_dashboard(self):
+        from render import render_html_dashboard
+        prep, outline, insights = self._make_inputs(None)
+        audio_url = "https://cdn.example.com/episode1.mp3"
+        html = render_html_dashboard(prep["metadata"], outline, insights,
+                                      audio_url, prep["metadata"]["webpage_url"])
+        assert "https://cdn.example.com/episode1.mp3" in html

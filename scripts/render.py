@@ -100,6 +100,53 @@ HOOK_ACTION_PATTERNS = [r"可行动的延展", r"Actionable next step", r"Action
 HOOK_PRIORITY_PATTERNS = [r"优先级", r"Priority"]
 
 
+def validate_inputs(prep_path, outline_path, insights_path):
+    """Check that all required input files exist before rendering.
+    Exits with clear error message if any file is missing."""
+    missing = []
+    for label, path in [("prep.json", prep_path), ("outline.json", outline_path), ("insights.md", insights_path)]:
+        if not Path(path).is_file():
+            missing.append((label, path))
+    if missing:
+        print("ERROR: Required input file(s) not found:", file=sys.stderr)
+        for label, path in missing:
+            print(f"  - {label}: {path}", file=sys.stderr)
+        print("\nDid you skip Step 3 (LLM analysis)?", file=sys.stderr)
+        print("Run the LLM analysis to generate outline.json and insights.md first.", file=sys.stderr)
+        sys.exit(1)
+
+
+def validate_timestamps(outline, duration):
+    """Check that timestamps in outline.json don't exceed audio duration.
+    Returns list of warning strings for any invalid timestamps."""
+    if not duration or duration <= 0:
+        return []
+    warnings = []
+
+    # Check outline section timestamps
+    for i, section in enumerate(outline.get("outline", [])):
+        ts = section.get("timestamp", "")
+        if ts:
+            secs = ts_to_seconds(ts)
+            if secs > duration:
+                warnings.append(
+                    f"Section {i+1} timestamp {ts} ({secs}s) exceeds audio duration ({duration}s)")
+
+    # Check mindmap timestamps
+    mm = outline.get("mindmap", {})
+    if isinstance(mm, dict):
+        for branch in mm.get("branches", []):
+            for child in branch.get("children", []):
+                ts = child.get("timestamp", "")
+                if ts:
+                    secs = ts_to_seconds(ts)
+                    if secs > duration:
+                        warnings.append(
+                            f"Mindmap timestamp {ts} ({secs}s) exceeds audio duration ({duration}s)")
+
+    return warnings
+
+
 def detect_language(insights_md):
     """Detect output language from insights.md headers.
     Falls back to Chinese (the default)."""
@@ -1304,7 +1351,11 @@ def main():
     parser.add_argument("--format", choices=["md", "html_simple", "html_dashboard"],
                         default="html_dashboard")
     parser.add_argument("--output", help="output path (default: based on title)")
+    parser.add_argument("--audio-url", help="web URL for audio (overrides local path in HTML)")
     args = parser.parse_args()
+
+    # P0: Validate all required inputs exist before proceeding
+    validate_inputs(args.prep, args.outline, args.insights)
 
     prep = json.loads(Path(args.prep).read_text(encoding="utf-8"))
 
@@ -1321,11 +1372,21 @@ def main():
 
     validate_outline(outline, outline_path)
 
+    # P1a: Validate timestamps against audio duration
+    duration = prep.get("metadata", {}).get("duration", 0)
+    ts_warnings = validate_timestamps(outline, duration)
+    for w in ts_warnings:
+        print(f"WARNING: {w}", file=sys.stderr)
+
     insights = Path(args.insights).read_text(encoding="utf-8")
 
     metadata = prep.get("metadata", {})
     audio_path = metadata.get("audio_path", "")
     audio_url_web = metadata.get("webpage_url", prep.get("url", ""))
+
+    # P2: --audio-url overrides local audio path for shareable HTML
+    if args.audio_url:
+        audio_path = args.audio_url
 
     # Use relative path for HTML so the file is portable when bundled with audio
     output_dir = Path(args.prep).parent
