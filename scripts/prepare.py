@@ -50,12 +50,33 @@ def load_config():
 
 # ==================== Token estimation ====================
 
+def _cjk_ratio(text):
+    """Return the fraction of characters that are CJK ideographs."""
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff'
+              or '\u3400' <= ch <= '\u4dbf'
+              or '\uf900' <= ch <= '\ufaff'
+              or '\U00020000' <= ch <= '\U0002a6df'
+              or '\u3040' <= ch <= '\u30ff'    # Hiragana + Katakana
+              or '\uac00' <= ch <= '\ud7af')   # Korean syllables
+    return cjk / len(text)
+
+
 def estimate_tokens(text):
     """
-    Rough token estimate. English ≈ 1 token per 4 chars.
+    Rough token estimate, language-aware.
+    - CJK text: ~1 char per token (use len/1.5 to account for punctuation/mixed).
+    - Latin/English: ~1 token per 4 chars.
+    - Mixed: blend proportionally.
     Be conservative — better to chunk early than blow context.
     """
-    return len(text) // 3
+    if not text:
+        return 0
+    ratio = _cjk_ratio(text)
+    cjk_chars = int(len(text) * ratio)
+    latin_chars = len(text) - cjk_chars
+    return int(cjk_chars / 1.5 + latin_chars / 4)
 
 
 # ==================== Stage 1: Metadata + Download ====================
@@ -247,13 +268,13 @@ def _aggregate_words(words, target_duration=20):
     """Merge consecutive words into ~target_duration second segments."""
     segments = []
     current = {"start": None, "end": None, "text": [], "speaker": None}
-    for w in words:
+    for i, w in enumerate(words):
         if current["start"] is None:
             current["start"] = w.start
             current["speaker"] = getattr(w, "speaker", None)
         if w.end - current["start"] > target_duration or \
            (getattr(w, "speaker", None) != current["speaker"] and current["text"]):
-            current["end"] = current["text"] and words[words.index(w) - 1].end or w.start
+            current["end"] = words[i - 1].end if current["text"] else w.start
             segments.append({
                 "start": current["start"],
                 "end": current["end"],

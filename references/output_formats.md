@@ -75,12 +75,14 @@ Layout features:
 
 Features:
 - **Sticky audio player at top** — always available while scrolling
-- **Sticky left sidebar TOC** — jump to any section instantly
-- **Two-column main** — outline on left, quotes/contrarian/hooks stacked on right (so you can compare structural breakdown vs key takeaways side by side)
 - **Click any timestamp `[12:30]`** anywhere → audio jumps there
 - **Search box** — live-filters all visible cards (sections, quotes, hooks, terms)
+- **Mobile fallback** — collapses to single column under 768px
+
+Planned (not yet implemented):
+- **Sticky left sidebar TOC** — jump to any section instantly
+- **Two-column main** — outline on left, quotes/contrarian/hooks stacked on right
 - **Dark mode toggle** — persisted in localStorage
-- **Mobile fallback** — collapses to single column under 1100px
 
 Information density: ~3x more visible content per screen vs `html_simple`. A 90-min episode's full notes typically fit in 2-3 desktop screens of scrolling.
 

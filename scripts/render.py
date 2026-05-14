@@ -13,6 +13,7 @@ import argparse
 import html as html_lib
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -1194,6 +1195,63 @@ def slugify(s, max_len=60):
     return s[:max_len].strip("-") or "untitled"
 
 
+def validate_outline(outline, source_path):
+    """Validate outline.json structure before rendering.
+
+    Checks required top-level keys, types, and nested fields.
+    Prints a clear error and exits if validation fails.
+    """
+    errors = []
+
+    # 1. Required top-level keys
+    required_keys = ["tldr", "outline", "mindmap", "key_terms"]
+    missing = [k for k in required_keys if k not in outline]
+    if missing:
+        errors.append(f"Missing required top-level keys: {', '.join(missing)}")
+
+    # 2. 'outline' must be a list with valid items
+    if "outline" in outline:
+        if not isinstance(outline["outline"], list):
+            errors.append("'outline' must be a list, got "
+                          f"{type(outline['outline']).__name__}")
+        else:
+            for i, item in enumerate(outline["outline"]):
+                if not isinstance(item, dict):
+                    errors.append(f"outline[{i}] must be an object, got "
+                                  f"{type(item).__name__}")
+                    continue
+                item_missing = []
+                if "section" not in item:
+                    item_missing.append("section")
+                if "key_points" not in item:
+                    item_missing.append("key_points")
+                if item_missing:
+                    errors.append(f"outline[{i}] missing required fields: "
+                                  f"{', '.join(item_missing)}")
+
+    # 3. 'mindmap' must be a string (Mermaid syntax) or a dict (structured)
+    if "mindmap" in outline:
+        if not isinstance(outline["mindmap"], (str, dict)):
+            errors.append("'mindmap' must be a string or object, got "
+                          f"{type(outline['mindmap']).__name__}")
+
+    # 4. 'key_terms' must be a list
+    if "key_terms" in outline:
+        if not isinstance(outline["key_terms"], list):
+            errors.append("'key_terms' must be a list, got "
+                          f"{type(outline['key_terms']).__name__}")
+
+    if errors:
+        print(f"ERROR: outline.json validation failed ({source_path}):",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        print("\nThe LLM-generated outline.json is malformed. "
+              "Please re-run Step 3 (LLM analysis) to regenerate it.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prep", required=True, help="prep.json path")
@@ -1205,7 +1263,20 @@ def main():
     args = parser.parse_args()
 
     prep = json.loads(Path(args.prep).read_text(encoding="utf-8"))
-    outline = json.loads(Path(args.outline).read_text(encoding="utf-8"))
+
+    outline_path = Path(args.outline)
+    try:
+        outline = json.loads(outline_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Failed to parse outline.json ({outline_path}): {e}",
+              file=sys.stderr)
+        print("\nThe file is not valid JSON. "
+              "Please re-run Step 3 (LLM analysis) to regenerate it.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    validate_outline(outline, outline_path)
+
     insights = Path(args.insights).read_text(encoding="utf-8")
 
     metadata = prep.get("metadata", {})
