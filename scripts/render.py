@@ -938,7 +938,12 @@ def _build_mermaid(mm):
 
 def _mm_escape(s):
     """Mermaid is sensitive to certain chars in labels."""
-    return str(s).replace("(", "（").replace(")", "）").replace("[", "【").replace("]", "】")
+    return (str(s)
+            .replace("(", "（").replace(")", "）")
+            .replace("[", "【").replace("]", "】")
+            .replace("#", "＃").replace("*", "＊")
+            .replace("{", "｛").replace("}", "｝")
+            .replace("|", "｜").replace(">", "＞"))
 
 
 def _render_outline_html(outline):

@@ -34,15 +34,15 @@ class TestEstimateTokens:
     def test_chinese_text(self):
         text = "这是一段用于测试的中文文本内容"
         tokens = estimate_tokens(text)
-        # 14 CJK chars / 1.5 = ~9 tokens
-        assert 6 <= tokens <= 15
+        # 14 CJK chars / 1.2 = ~11 tokens
+        assert 8 <= tokens <= 15
 
     def test_mixed_text(self):
         text = "这是mixed混合text测试"
         tokens = estimate_tokens(text)
         assert tokens > 0
         # Should be between pure-CJK and pure-English estimates
-        pure_cjk_est = int(len(text) / 1.5)
+        pure_cjk_est = int(len(text) / 1.2)
         pure_latin_est = int(len(text) / 4)
         assert pure_latin_est <= tokens <= pure_cjk_est
 

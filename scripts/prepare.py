@@ -8,6 +8,8 @@ and full_transcript_path.
 """
 
 import argparse
+import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -16,8 +18,39 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+
+def _retry(max_attempts=3, base_delay=2, backoff=2):
+    """Retry with exponential backoff for transient API failures."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    if attempt == max_attempts:
+                        raise
+                    delay = base_delay * (backoff ** (attempt - 1))
+                    print(f"   ⚠️ Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+
+@contextmanager
+def _file_lock(lock_path, timeout=300):
+    """Acquire an exclusive file lock. Prevents concurrent writes."""
+    lock_file = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
 
 CONFIG_DIR = Path.home() / ".podcast-to-notes"
 CONFIG_FILE = CONFIG_DIR / "env.json"
@@ -68,7 +101,7 @@ def _cjk_ratio(text):
 def estimate_tokens(text):
     """
     Rough token estimate, language-aware.
-    - CJK text: ~1 char per token (use len/1.5 to account for punctuation/mixed).
+    - CJK text: ~1 char per token (use len/1.2 to account for punctuation/mixed).
     - Latin/English: ~1 token per 4 chars.
     - Mixed: blend proportionally.
     Be conservative — better to chunk early than blow context.
@@ -78,7 +111,7 @@ def estimate_tokens(text):
     ratio = _cjk_ratio(text)
     cjk_chars = int(len(text) * ratio)
     latin_chars = len(text) - cjk_chars
-    return int(cjk_chars / 1.5 + latin_chars / 4)
+    return int(cjk_chars / 1.2 + latin_chars / 4)
 
 
 # ==================== Audio validation ====================
@@ -112,32 +145,36 @@ def validate_audio_file(audio_path):
 
 def stage_metadata(url, work_dir):
     meta_file = work_dir / "metadata.json"
-    if meta_file.exists():
-        return json.loads(meta_file.read_text(encoding="utf-8"))
+    with _file_lock(work_dir / ".metadata.lock"):
+        if meta_file.exists():
+            cached = json.loads(meta_file.read_text(encoding="utf-8"))
+            if cached.get("webpage_url") == url:
+                return cached
+            print("   ⚠️ URL changed, refreshing metadata...")
 
-    try:
-        result = subprocess.run(
-            ["yt-dlp", "--skip-download", "--dump-json", "--no-playlist", url],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            print(f"   ⚠️ Metadata fetch failed: {result.stderr[-200:]}")
+        try:
+            result = subprocess.run(
+                ["yt-dlp", "--skip-download", "--dump-json", "--no-playlist", url],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                print(f"   ⚠️ Metadata fetch failed: {result.stderr[-200:]}")
+                return {"webpage_url": url}
+            raw = json.loads(result.stdout)
+            meta = {
+                "title": raw.get("title", ""),
+                "uploader": raw.get("uploader", ""),
+                "upload_date": raw.get("upload_date", ""),
+                "duration": raw.get("duration", 0),
+                "webpage_url": raw.get("webpage_url", url),
+                "description": (raw.get("description", "") or "")[:500],
+            }
+            meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+            return meta
+        except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            print(f"   ⚠️ {e}")
             return {"webpage_url": url}
-        raw = json.loads(result.stdout)
-        meta = {
-            "title": raw.get("title", ""),
-            "uploader": raw.get("uploader", ""),
-            "upload_date": raw.get("upload_date", ""),
-            "duration": raw.get("duration", 0),
-            "webpage_url": raw.get("webpage_url", url),
-            "description": (raw.get("description", "") or "")[:500],
-        }
-        meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
-        return meta
-    except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        print(f"   ⚠️ {e}")
-        return {"webpage_url": url}
 
 
 def stage_download(url, work_dir):
@@ -204,11 +241,14 @@ def stage_local_audio(audio_file, work_dir):
         "description": "",
     }
     meta_file = work_dir / "metadata.json"
-    if not meta_file.exists():
+    with _file_lock(work_dir / ".metadata.lock"):
+        if meta_file.exists():
+            cached = json.loads(meta_file.read_text(encoding="utf-8"))
+            if cached.get("title") == src.stem and cached.get("duration", 0) > 0:
+                return dest, cached
+            print("   ⚠️ Audio source changed, refreshing metadata...")
         meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
                              encoding="utf-8")
-    else:
-        meta = json.loads(meta_file.read_text(encoding="utf-8"))
 
     return dest, meta
 
@@ -238,41 +278,42 @@ def stage_transcribe(audio_path, work_dir, config, model_size="large-v3-turbo"):
     """Returns (segments, detected_language). Segments: [{start, end, text, speaker?}]."""
     segments_file = work_dir / "segments.json"
     lang_file = work_dir / "language.txt"
-    if segments_file.exists():
-        print(f"   ↩️ Reusing existing transcript")
-        segments = json.loads(segments_file.read_text(encoding="utf-8"))
-        lang = lang_file.read_text(encoding="utf-8").strip() if lang_file.exists() else "en"
-        return segments, lang
+    with _file_lock(work_dir / ".segments.lock"):
+        if segments_file.exists():
+            print(f"   ↩️ Reusing existing transcript")
+            segments = json.loads(segments_file.read_text(encoding="utf-8"))
+            lang = lang_file.read_text(encoding="utf-8").strip() if lang_file.exists() else "en"
+            return segments, lang
 
-    backend = config["transcription"]
-    btype = backend["type"]
-    provider = backend["provider"]
-    print(f"   Backend: {provider} ({btype})")
-    print(f"   Language: auto-detect (zh / en supported)")
+        backend = config["transcription"]
+        btype = backend["type"]
+        provider = backend["provider"]
+        print(f"   Backend: {provider} ({btype})")
+        print(f"   Language: auto-detect (zh / en supported)")
 
-    if btype == "cloud":
-        segments, detected = _transcribe_cloud(audio_path, provider)
-    elif provider == "mlx":
-        segments, detected = _transcribe_mlx(audio_path, model_size=model_size)
-    elif provider == "whisperx":
-        segments, detected = _transcribe_whisperx(audio_path, model_size=model_size)
-    elif provider in ("faster_whisper_cuda", "faster_whisper_cpu"):
-        segments, detected = _transcribe_faster_whisper(
-            audio_path, use_cuda=(provider == "faster_whisper_cuda"),
-            model_size=model_size)
-    else:
-        raise RuntimeError(f"Unknown backend: {provider}")
+        if btype == "cloud":
+            segments, detected = _transcribe_cloud(audio_path, provider)
+        elif provider == "mlx":
+            segments, detected = _transcribe_mlx(audio_path, model_size=model_size)
+        elif provider == "whisperx":
+            segments, detected = _transcribe_whisperx(audio_path, model_size=model_size)
+        elif provider in ("faster_whisper_cuda", "faster_whisper_cpu"):
+            segments, detected = _transcribe_faster_whisper(
+                audio_path, use_cuda=(provider == "faster_whisper_cuda"),
+                model_size=model_size)
+        else:
+            raise RuntimeError(f"Unknown backend: {provider}")
 
-    detected = _normalize_language(detected) or "en"
-    if detected not in SUPPORTED_LANGUAGES:
-        print(f"   ⚠️ Detected language '{detected}' not in supported set {SUPPORTED_LANGUAGES}; "
-              f"transcript may be okay but downstream prompts assume zh or en.")
+        detected = _normalize_language(detected) or "en"
+        if detected not in SUPPORTED_LANGUAGES:
+            print(f"   ⚠️ Detected language '{detected}' not in supported set {SUPPORTED_LANGUAGES}; "
+                  f"transcript may be okay but downstream prompts assume zh or en.")
 
-    print(f"   ✓ Detected language: {detected}")
+        print(f"   ✓ Detected language: {detected}")
 
-    segments_file.write_text(json.dumps(segments, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
-    lang_file.write_text(detected, encoding="utf-8")
+        segments_file.write_text(json.dumps(segments, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+        lang_file.write_text(detected, encoding="utf-8")
     return segments, detected
 
 
@@ -286,6 +327,7 @@ def _transcribe_cloud(audio_path, provider):
     raise RuntimeError(f"Unknown cloud provider: {provider}")
 
 
+@_retry()
 def _transcribe_groq(audio_path):
     """Groq Whisper Large v3 — fastest, ~$0.04/hr. Auto language detection."""
     try:
@@ -310,6 +352,7 @@ def _transcribe_groq(audio_path):
     return segments, detected
 
 
+@_retry()
 def _transcribe_deepgram(audio_path):
     """Deepgram Nova-3 — supports diarization. Auto language detection."""
     try:
@@ -331,26 +374,49 @@ def _transcribe_deepgram(audio_path):
     return _aggregate_words(words), detected
 
 
-def _aggregate_words(words, target_duration=20):
-    """Merge consecutive words into ~target_duration second segments."""
+def _aggregate_words(words, target_duration=10, min_duration=3):
+    """Merge consecutive words into segments using sentence boundaries and time limits."""
     segments = []
     current = {"start": None, "end": None, "text": [], "speaker": None}
     for i, w in enumerate(words):
         if current["start"] is None:
             current["start"] = w.start
             current["speaker"] = getattr(w, "speaker", None)
-        if w.end - current["start"] > target_duration or \
-           (getattr(w, "speaker", None) != current["speaker"] and current["text"]):
-            current["end"] = words[i - 1].end if current["text"] else w.start
-            segments.append({
-                "start": current["start"],
-                "end": current["end"],
-                "text": " ".join(current["text"]),
-                "speaker": f"SPEAKER_{current['speaker']}" if current["speaker"] is not None else None,
-            })
-            current = {"start": w.start, "end": None, "text": [],
-                       "speaker": getattr(w, "speaker", None)}
-        current["text"].append(w.punctuated_word if hasattr(w, "punctuated_word") else w.word)
+
+        word_text = w.punctuated_word if hasattr(w, "punctuated_word") else w.word
+        current["text"].append(word_text)
+        elapsed = w.end - current["start"]
+
+        # Speaker change boundary
+        speaker_changed = (getattr(w, "speaker", None) != current["speaker"]
+                           and len(current["text"]) > 1)
+        # Sentence boundary (only if minimum duration met)
+        sentence_end = (elapsed >= min_duration and word_text
+                        and word_text[-1] in '.!?。！？')
+        # Time limit fallback
+        time_limit = elapsed > target_duration
+
+        if speaker_changed or sentence_end or time_limit:
+            if speaker_changed:
+                # Put current word in next segment
+                current["text"].pop()
+                current["end"] = words[i - 1].end if i > 0 else w.start
+            else:
+                current["end"] = w.end
+
+            if current["text"]:
+                segments.append({
+                    "start": current["start"],
+                    "end": current["end"],
+                    "text": " ".join(current["text"]),
+                    "speaker": f"SPEAKER_{current['speaker']}" if current["speaker"] is not None else None,
+                })
+            current = {"start": w.start if speaker_changed else None,
+                       "end": None, "text": [], "speaker": getattr(w, "speaker", None)}
+            if speaker_changed:
+                current["text"].append(word_text)
+
+    # Final segment
     if current["text"]:
         segments.append({
             "start": current["start"],
@@ -361,6 +427,7 @@ def _aggregate_words(words, target_duration=20):
     return segments
 
 
+@_retry()
 def _transcribe_assemblyai(audio_path):
     """AssemblyAI — supports diarization. Auto language detection."""
     try:
