@@ -317,6 +317,7 @@ def render_html_dashboard(metadata, outline, insights_md, audio_src, audio_url_w
     L = LABELS[lang]
 
     insights_parsed = _parse_insights_sections(insights_md)
+    audio_url_json = json.dumps(audio_url_web)
     quotes_html = _render_quotes_dense(insights_parsed.get("quotes", ""), L)
     contrarian_html = _render_contrarian_dense(insights_parsed.get("contrarian", ""), L)
     hooks_html = _render_hooks_dense(insights_parsed.get("hooks", ""), L)
@@ -812,7 +813,7 @@ mermaid.initialize({{ startOnLoad: true, theme: 'base', themeVariables: {{
     <source src="{html_lib.escape(audio_src)}">
   </audio>
   <input type="text" class="search" id="search" placeholder="{html_lib.escape(L['search_placeholder'])}" autocomplete="off">
-  <button class="pill" onclick="window.open('{html_lib.escape(audio_url_web)}','_blank')">Open source</button>
+  <button class="pill" id="open-source-btn">Open source</button>
 </nav>
 
 <main>
@@ -886,6 +887,11 @@ mermaid.initialize({{ startOnLoad: true, theme: 'base', themeVariables: {{
 </footer>
 
 <script>
+  // Open source button
+  document.getElementById('open-source-btn').addEventListener('click', () => {{
+    window.open({audio_url_json}, '_blank');
+  }});
+
   // Click timestamp → seek audio + scroll to top
   document.body.addEventListener('click', e => {{
     const link = e.target.closest('.ts');
@@ -1034,23 +1040,46 @@ def _render_terms_dense(terms, L=None):
 def _parse_insights_sections(md):
     """
     Split insights markdown into quotes / contrarian / hooks.
-    Looks for the canonical headers from the prompt.
+    Uses broad keyword matching to tolerate LLM header variations.
+    Warns on unrecognized ## sections to prevent silent data loss.
     """
+    QUOTE_KEYWORDS = ("金句", "Quotes", "Quote", "Quotable", "名言", "语录")
+    CONTRA_KEYWORDS = ("反共识", "Contrarian", "contrarian", "逆向", "颠覆")
+    HOOK_KEYWORDS = ("灵感", "Hooks", "Hook", "Inspiration", "inspiration", "钩子")
+
     sections = {"quotes": "", "contrarian": "", "hooks": ""}
     current = None
+    unrecognized_headers = []
+
     for line in md.split("\n"):
         stripped = line.strip()
-        if "## " in stripped and ("金句" in stripped or "Quotable" in stripped or "Quotes" in stripped):
-            current = "quotes"
+        # Detect any ## header
+        if re.match(r"^##\s+", stripped):
+            matched = None
+            if any(kw in stripped for kw in QUOTE_KEYWORDS):
+                matched = "quotes"
+            elif any(kw in stripped for kw in CONTRA_KEYWORDS):
+                matched = "contrarian"
+            elif any(kw in stripped for kw in HOOK_KEYWORDS):
+                matched = "hooks"
+
+            if matched:
+                current = matched
+            else:
+                unrecognized_headers.append(stripped)
+                current = None
             continue
-        elif "## " in stripped and ("反共识" in stripped or "Contrarian" in stripped):
-            current = "contrarian"
-            continue
-        elif "## " in stripped and ("灵感" in stripped or "Hooks" in stripped or "Inspiration" in stripped):
-            current = "hooks"
-            continue
+
         if current:
             sections[current] += line + "\n"
+
+    if unrecognized_headers:
+        import sys
+        print(f"WARNING: insights.md contains unrecognized section header(s) "
+              f"(content may be missing from render):", file=sys.stderr)
+        for h in unrecognized_headers:
+            print(f"  - {h}", file=sys.stderr)
+
     return sections
 
 
@@ -1192,50 +1221,195 @@ def _linkify_timestamps(escaped_text):
 
 
 def _md_to_html_with_timestamps(md):
-    """Lightweight MD → HTML for the simple format."""
+    """Lightweight MD → HTML for the simple format.
+
+    Supports: h2, h3, blockquotes, flat & nested lists, fenced code blocks,
+    pipe-delimited tables, bold, and timestamp linkification.
+    Uses a state-machine approach — current state is one of:
+      "normal", "blockquote", "code_block", "table"
+    Lists are tracked separately via a depth stack so they can nest.
+    """
     lines = md.split("\n")
     out = []
-    in_blockquote = False
-    in_list = False
+
+    # -- state tracking --
+    state = "normal"  # "normal" | "blockquote" | "code_block" | "table"
+    code_lang = ""
+    list_depth_stack = []  # stack of indent-levels; length = nesting depth
+    table_has_header = False
+
+    # -- helpers --
+    def _rich_inline(text):
+        """Escape HTML, apply bold and timestamp links."""
+        text = html_lib.escape(text)
+        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+        text = _linkify_timestamps(text)
+        return text
+
+    def _close_all_lists():
+        while list_depth_stack:
+            list_depth_stack.pop()
+            out.append("</li></ul>")
+
+    def _close_lists_to_depth(target_depth):
+        """Close nested lists until we reach *target_depth* (0 = close all)."""
+        while len(list_depth_stack) > target_depth:
+            list_depth_stack.pop()
+            out.append("</li></ul>")
+
+    def _leave_state():
+        """Close whatever block-level construct is open."""
+        nonlocal state, table_has_header
+        _close_all_lists()
+        if state == "blockquote":
+            out.append("</blockquote>")
+        elif state == "code_block":
+            out.append("</code></pre>")
+        elif state == "table":
+            out.append("</tbody></table>")
+            table_has_header = False
+        state = "normal"
 
     for line in lines:
-        if line.startswith("## "):
-            if in_list: out.append("</ul>"); in_list = False
-            if in_blockquote: out.append("</blockquote>"); in_blockquote = False
-            out.append(f"<h2>{html_lib.escape(line[3:].strip())}</h2>")
-            continue
-        if line.startswith("### "):
-            if in_list: out.append("</ul>"); in_list = False
-            out.append(f"<h3>{html_lib.escape(line[4:].strip())}</h3>")
-            continue
-        if line.startswith("> "):
-            if not in_blockquote:
-                out.append("<blockquote>"); in_blockquote = True
-            content = line[2:].strip()
-            content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html_lib.escape(content))
-            content = _linkify_timestamps(content)
-            out.append(f"<p>{content}</p>")
-            continue
-        if in_blockquote and not line.strip():
-            out.append("</blockquote>"); in_blockquote = False; continue
-        if in_blockquote:
-            out.append(f"<p>{html_lib.escape(line.strip())}</p>"); continue
-        if line.startswith("- ") or line.startswith("* "):
-            if not in_list: out.append("<ul>"); in_list = True
-            content = line[2:].strip()
-            content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html_lib.escape(content))
-            content = _linkify_timestamps(content)
-            out.append(f"<li>{content}</li>")
-            continue
-        if in_list and not line.strip():
-            out.append("</ul>"); in_list = False; continue
-        if line.strip():
-            content = html_lib.escape(line.strip())
-            content = _linkify_timestamps(content)
-            out.append(f"<p>{content}</p>")
+        stripped = line.rstrip()
 
-    if in_blockquote: out.append("</blockquote>")
-    if in_list: out.append("</ul>")
+        # ---- fenced code blocks (``` …) ----
+        if stripped.startswith("```"):
+            if state == "code_block":
+                # closing fence
+                out.append("</code></pre>")
+                state = "normal"
+                code_lang = ""
+                continue
+            else:
+                # opening fence – leave any previous state first
+                if state != "normal" or list_depth_stack:
+                    _leave_state()
+                lang = stripped[3:].strip()
+                code_lang = lang
+                cls = f' class="language-{html_lib.escape(lang)}"' if lang else ""
+                out.append(f"<pre><code{cls}>")
+                state = "code_block"
+                continue
+
+        if state == "code_block":
+            # Inside a code block: escape HTML, do NOT linkify timestamps.
+            out.append(html_lib.escape(line))
+            continue
+
+        # ---- table rows (| … |) ----
+        if stripped.startswith("|"):
+            # separator row like |---|---|
+            if re.match(r"^\|[\s\-:|]+\|$", stripped):
+                # just marks the header boundary; skip it
+                continue
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if state != "table":
+                # entering a table – leave previous state
+                if state != "normal" or list_depth_stack:
+                    _leave_state()
+                state = "table"
+                table_has_header = True
+                out.append("<table><thead><tr>")
+                out.append("".join(f"<th>{html_lib.escape(c)}</th>" for c in cells))
+                out.append("</tr></thead><tbody>")
+                continue
+            # data row
+            out.append("<tr>")
+            out.append("".join(f"<td>{html_lib.escape(c)}</td>" for c in cells))
+            out.append("</tr>")
+            continue
+
+        # If we were in a table and the line isn't a table row, leave table
+        if state == "table":
+            _leave_state()
+
+        # ---- headers ----
+        if stripped.startswith("## "):
+            if list_depth_stack:
+                _close_all_lists()
+            if state == "blockquote":
+                _leave_state()
+            out.append(f"<h2>{html_lib.escape(stripped[3:].strip())}</h2>")
+            continue
+        if stripped.startswith("### "):
+            if list_depth_stack:
+                _close_all_lists()
+            out.append(f"<h3>{html_lib.escape(stripped[4:].strip())}</h3>")
+            continue
+
+        # ---- blockquotes ----
+        if stripped.startswith("> "):
+            if list_depth_stack:
+                _close_all_lists()
+            if state != "blockquote":
+                if state != "normal":
+                    _leave_state()
+                out.append("<blockquote>")
+                state = "blockquote"
+            content = stripped[2:].strip()
+            out.append(f"<p>{_rich_inline(content)}</p>")
+            continue
+        if state == "blockquote" and not stripped:
+            _leave_state()
+            continue
+        if state == "blockquote":
+            out.append(f"<p>{html_lib.escape(stripped.strip())}</p>")
+            continue
+
+        # ---- list items (flat and nested) ----
+        list_match = re.match(r"^( *)([-*]) (.*)$", line)
+        if list_match:
+            indent = len(list_match.group(1))
+            content = list_match.group(3).strip()
+
+            if not list_depth_stack:
+                # Start a brand-new list.
+                out.append("<ul>")
+                list_depth_stack.append(indent)
+            elif indent > list_depth_stack[-1]:
+                # Deeper nesting – open a child <ul> inside the current <li>.
+                out.append("<ul>")
+                list_depth_stack.append(indent)
+            elif indent < list_depth_stack[-1]:
+                # Returning to a shallower level.
+                # Find the stack index whose indent matches (or is the
+                # closest level <= this indent).
+                keep = 1  # always keep at least one level
+                for i, lvl in enumerate(list_depth_stack):
+                    if lvl <= indent:
+                        keep = i + 1  # keep through this level
+                _close_lists_to_depth(keep)
+                # Close the previous <li> at this level so we can start a new one.
+                out.append("</li>")
+            else:
+                # Same level – close previous <li>.
+                out.append("</li>")
+
+            out.append(f"<li>{_rich_inline(content)}")
+            continue
+
+        # ---- blank line: close open lists ----
+        if not stripped:
+            if list_depth_stack:
+                _close_all_lists()
+            continue
+
+        # ---- normal paragraph ----
+        if list_depth_stack:
+            _close_all_lists()
+        content = html_lib.escape(stripped.strip())
+        content = _linkify_timestamps(content)
+        out.append(f"<p>{content}</p>")
+
+    # -- close anything still open --
+    _close_all_lists()
+    if state == "blockquote":
+        out.append("</blockquote>")
+    elif state == "code_block":
+        out.append("</code></pre>")
+    elif state == "table":
+        out.append("</tbody></table>")
     return "\n".join(out)
 
 

@@ -21,8 +21,20 @@ If you have a "thinking mode" available (Claude extended thinking, DeepSeek reas
 - `{date}` — upload date
 - `{focus}` — user's focus area (from Step 1 of SKILL.md)
 - `{output_language}` — `中文` (default) or `English`. Determined in Step 1 of SKILL.md.
+- `{section_range}` — dynamic section count range based on duration (from `prep.json`). See table below.
 - `{chunk_info}` — for multi-chunk episodes, e.g. "chunk 2 of 4, covers 00:45:00 – 01:30:00"; empty string for single-chunk
 - `{transcript}` — the chunk's transcript text
+
+**Section range guidance** (substitute into `{section_range}`):
+
+| Duration | `section_range` |
+|---|---|
+| < 5 min | `2-4` |
+| 5–30 min | `3-7` |
+| 30–90 min | `5-12` |
+| > 90 min | `8-18` |
+
+`prepare.py` outputs `section_range` in `prep.json` automatically based on duration (with token-count fallback).
 
 **System prompt**:
 
@@ -55,7 +67,7 @@ Do not include any extra text or markdown wrappers around the JSON.
   // 3-sentence summary — a take, NOT a flow narrative. Written in {output_language}.
   "tldr": "string (required)",
 
-  // 5-12 sections. Every timestamp must come from the transcript.
+  // {section_range} sections. Every timestamp must come from the transcript.
   "outline": [
     {
       "section": "string (required) — verb-first title in {output_language}. e.g. '拆解 Transformer 注意力机制' / 'Unpack the Transformer attention mechanism', NOT '关于 Transformer'",
@@ -96,7 +108,7 @@ Do not include any extra text or markdown wrappers around the JSON.
 1. All natural-language fields in {output_language}. Section titles verb-first.
 2. worth_listening=false for ads, intros, off-topic chatter, sponsorships.
 3. Mind map: 3-7 top-level branches, each with 2-5 children. Every leaf has a timestamp.
-4. Outline: 5-12 sections. Each timestamp must come from the transcript (don't make them up).
+4. Outline: {section_range} sections. Each timestamp must come from the transcript (don't make them up).
 5. key_terms: only terms that are LOAD-BEARING in this episode. Do not list every acronym. The `term` field keeps the original wording — only `translation` and `explanation` use {output_language}.
 6. Output VALID JSON ONLY. No markdown fences, no commentary.
 
@@ -173,6 +185,13 @@ A quote qualifies only if it meets ≥2 of:
 - the guest's earned wisdom, not common knowledge
 
 Reject: vacuous truths ("AI changes everything"), bare facts, pleasantries, stale takeaways.
+
+❌ Rejected examples (do NOT output quotes like these):
+- "AI is going to change everything" — vacuous, no specific insight
+- "The future belongs to those who embrace change" — motivational poster, not earned wisdom
+- "This is really exciting / fascinating" — pleasantry, not a quote
+- "We're still early" — cliché with no supporting reasoning
+- "It's all about the data" — vague truism, could apply to anything
 
 For each quote use this format exactly (Chinese example shown; substitute English equivalents from the table when {output_language} is English):
 

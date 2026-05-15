@@ -8,8 +8,9 @@ and full_transcript_path.
 """
 
 import argparse
-import fcntl
+import difflib
 import functools
+import glob as glob_mod
 import hashlib
 import json
 import os
@@ -42,13 +43,23 @@ def _retry(max_attempts=3, base_delay=2, backoff=2):
 
 @contextmanager
 def _file_lock(lock_path, timeout=300):
-    """Acquire an exclusive file lock. Prevents concurrent writes."""
+    """Acquire an exclusive file lock. Prevents concurrent writes.
+    Uses fcntl on Unix, msvcrt on Windows."""
     lock_file = open(lock_path, 'w')
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        yield
+        try:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except ImportError:
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
     finally:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
 
 
@@ -61,6 +72,11 @@ ENV_FILE = CONFIG_DIR / ".env"
 LONG_THRESHOLD_TOKENS = 60_000
 CHUNK_TARGET_TOKENS = 25_000   # ~30-45 min per chunk
 OVERLAP_SECONDS = 90           # 1.5 min overlap to preserve cross-boundary context
+
+# PASS2 strategy thresholds (by full transcript token count)
+PASS2_FULL_THRESHOLD = 200_000      # Below this: Strategy A (full transcript)
+PASS2_CHUNKED_THRESHOLD = 500_000   # Below this: Strategy B (chunked + selection)
+# Above 500K: Strategy C (reduce chunk size and re-chunk)
 
 
 def load_env_into_environ():
@@ -695,19 +711,187 @@ def chunk_segments(segments, chunk_target_tokens=None):
     return chunks
 
 
+def compute_section_range(duration_seconds, token_count):
+    """Return a section range string (e.g. '5-12') based on episode duration.
+    Falls back to token_count heuristic when duration is 0 or unavailable."""
+    if duration_seconds and duration_seconds > 0:
+        if duration_seconds < 300:        # < 5 min
+            return "2-4"
+        elif duration_seconds < 1800:     # 5-30 min
+            return "3-7"
+        elif duration_seconds < 5400:     # 30-90 min
+            return "5-12"
+        else:                             # > 90 min
+            return "8-18"
+    # Fallback: estimate from token count (~500 tokens/min of speech)
+    est_minutes = token_count / 500 if token_count else 30
+    if est_minutes < 5:
+        return "2-4"
+    elif est_minutes < 30:
+        return "3-7"
+    elif est_minutes < 90:
+        return "5-12"
+    else:
+        return "8-18"
+
+
+# ==================== Chunk outline merging ====================
+
+def _title_word_overlap(a, b):
+    """Return fraction of overlapping words between two section titles."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    return len(intersection) / min(len(words_a), len(words_b))
+
+
+def merge_chunk_outlines(chunk_outlines):
+    """Merge a list of per-chunk PASS1 outline dicts into one combined outline.
+
+    Pure function -- no I/O. Each element must conform to pass1_schema.json.
+
+    Args:
+        chunk_outlines: list[dict] -- per-chunk outlines in order.
+
+    Returns:
+        dict conforming to pass1_schema.json.
+    """
+    if not chunk_outlines:
+        raise ValueError("chunk_outlines must be a non-empty list")
+    if len(chunk_outlines) == 1:
+        return chunk_outlines[0]
+
+    # --- tldr: concatenate with separator ---
+    tldr = " | ".join(c["tldr"] for c in chunk_outlines if c.get("tldr"))
+
+    # --- outline: concatenate sections, deduplicate consecutive similar titles ---
+    all_sections = []
+    for c in chunk_outlines:
+        for sec in c.get("outline", []):
+            all_sections.append(sec)
+
+    merged_sections = []
+    for sec in all_sections:
+        if merged_sections and _title_word_overlap(
+                merged_sections[-1]["section"], sec["section"]) > 0.7:
+            # Keep the one with more key_points
+            prev = merged_sections[-1]
+            if len(sec.get("key_points", [])) > len(prev.get("key_points", [])):
+                merged_sections[-1] = sec
+        else:
+            merged_sections.append(sec)
+
+    # --- mindmap: first chunk's root, merge branches by label, cap at 8 ---
+    first_mindmap = chunk_outlines[0].get("mindmap", {})
+    if isinstance(first_mindmap, str):
+        # Raw Mermaid string -- use first chunk's as-is
+        merged_mindmap = first_mindmap
+    else:
+        root = first_mindmap.get("root", "Podcast")
+        branch_map = {}  # label -> list of children
+        for c in chunk_outlines:
+            mm = c.get("mindmap", {})
+            if isinstance(mm, str):
+                continue
+            for branch in mm.get("branches", []):
+                label = branch["label"]
+                if label not in branch_map:
+                    branch_map[label] = []
+                existing_labels = {ch["label"] for ch in branch_map[label]}
+                for child in branch.get("children", []):
+                    if child["label"] not in existing_labels:
+                        branch_map[label].append(child)
+                        existing_labels.add(child["label"])
+
+        branches = [{"label": lbl, "children": children}
+                     for lbl, children in branch_map.items()]
+        branches = branches[:8]  # cap at 8 branches
+        merged_mindmap = {"root": root, "branches": branches}
+
+    # --- key_terms: union by term, keep longest explanation ---
+    terms_map = {}  # term -> dict
+    for c in chunk_outlines:
+        for kt in c.get("key_terms", []):
+            term = kt["term"]
+            if term not in terms_map:
+                terms_map[term] = dict(kt)
+            else:
+                existing = terms_map[term]
+                if len(kt.get("explanation", "")) > len(existing.get("explanation", "")):
+                    terms_map[term]["explanation"] = kt["explanation"]
+                if len(kt.get("translation", "")) > len(existing.get("translation", "")):
+                    terms_map[term]["translation"] = kt["translation"]
+
+    return {
+        "tldr": tldr,
+        "outline": merged_sections,
+        "mindmap": merged_mindmap,
+        "key_terms": list(terms_map.values()),
+    }
+
+
 # ==================== Main ====================
+
+def _run_merge_chunks(args):
+    """CLI handler for --merge-chunks: load chunk outline files, merge, validate, save."""
+    # Import validate_outline from render.py (sibling script)
+    scripts_dir = Path(__file__).parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from render import validate_outline
+
+    # Expand globs and collect file paths
+    paths = []
+    for pattern in args.merge_chunks:
+        expanded = sorted(glob_mod.glob(pattern))
+        if not expanded:
+            sys.exit(f"ERROR: No files matched pattern: {pattern}")
+        paths.extend(expanded)
+
+    if len(paths) < 2:
+        sys.exit(f"ERROR: Need at least 2 chunk outline files to merge, got {len(paths)}")
+
+    print(f"Merging {len(paths)} chunk outlines...")
+    chunk_outlines = []
+    for p in paths:
+        data = json.loads(Path(p).read_text(encoding="utf-8"))
+        chunk_outlines.append(data)
+        print(f"  Loaded: {p}")
+
+    merged = merge_chunk_outlines(chunk_outlines)
+
+    # Validate against pass1_schema.json
+    schema_path = Path(__file__).parent.parent / "references" / "pass1_schema.json"
+    validate_outline(merged, str(schema_path))
+    print("  Schema validation passed.")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "outline.json"
+    out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  Saved merged outline: {out_path}")
+
 
 def main():
     parser = argparse.ArgumentParser()
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("url", nargs="?", default=None, help="Podcast/YouTube URL")
     source.add_argument("--audio-file", help="Path to a local audio file (skips download)")
+    source.add_argument("--merge-chunks", nargs="+", metavar="FILE",
+                        help="Merge per-chunk outline JSON files into one outline.json")
     parser.add_argument("--output-dir", default="./podcast_output")
     parser.add_argument("--model-size", default="large-v3-turbo",
                         help="Whisper model size for local backends (default: large-v3-turbo)")
     parser.add_argument("--chunk-target", type=int, default=CHUNK_TARGET_TOKENS,
                         help=f"Target tokens per chunk (default: {CHUNK_TARGET_TOKENS})")
     args = parser.parse_args()
+
+    # Handle --merge-chunks mode separately (no transcription needed)
+    if args.merge_chunks:
+        _run_merge_chunks(args)
+        return
 
     if not args.url and not args.audio_file:
         parser.error("Either a URL or --audio-file is required.")
@@ -764,6 +948,24 @@ def main():
     full_tokens = estimate_tokens(full_path.read_text(encoding="utf-8"))
     print(f"   ✓ {full_tokens:,} estimated tokens")
 
+    # Determine PASS2 strategy based on transcript length
+    if full_tokens <= PASS2_FULL_THRESHOLD:
+        pass2_strategy = "full"
+        pass2_tokens_per_chunk = None
+    elif full_tokens <= PASS2_CHUNKED_THRESHOLD:
+        pass2_strategy = "chunked"
+        pass2_tokens_per_chunk = min(full_tokens // 4, 50_000)
+    else:
+        pass2_strategy = "reduce_and_rechunk"
+        pass2_tokens_per_chunk = min(full_tokens // 8, 50_000)
+
+    if pass2_strategy != "full":
+        print(f"\n⚠️  WARNING: Transcript is {full_tokens:,} tokens. "
+              f"PASS2 strategy: {pass2_strategy}.", file=sys.stderr)
+        if pass2_strategy == "reduce_and_rechunk":
+            print(f"   Consider rerunning with --chunk-target 15000 for better results.",
+                  file=sys.stderr)
+
     print("\n✂️ Chunking...")
     chunks = chunk_segments(segments, chunk_target_tokens=args.chunk_target)
     if len(chunks) == 1:
@@ -791,15 +993,21 @@ def main():
     # If transcript is in Chinese, output Chinese notes; if English, English.
     output_language = "中文" if detected_lang == "zh" else "English"
 
+    duration = metadata.get("duration", 0)
+    section_range = compute_section_range(duration, full_tokens)
+
     prep = {
         "url": args.url or str(Path(args.audio_file).absolute()),
         "metadata": metadata,
         "transcript_language": detected_lang,
         "output_language": output_language,
+        "section_range": section_range,
         "full_transcript_path": str(full_path.absolute()),
         "full_transcript_tokens": full_tokens,
         "chunks": chunks,
         "is_long_episode": len(chunks) > 1,
+        "pass2_strategy": pass2_strategy,
+        "pass2_tokens_per_chunk": pass2_tokens_per_chunk,
         "thresholds": {
             "long_episode_tokens": LONG_THRESHOLD_TOKENS,
             "chunk_target_tokens": args.chunk_target,
@@ -807,6 +1015,19 @@ def main():
         },
         "work_dir": str(work_dir.absolute()),
     }
+
+    # For multi-chunk episodes, tell the calling agent how to auto-merge
+    if len(chunks) > 1:
+        prep["pass2_merge_hint"] = {
+            "description": "After running PASS1 on each chunk, merge outlines automatically.",
+            "command": (
+                f"python scripts/prepare.py --merge-chunks"
+                f" {output_dir}/chunk_outline_*.json"
+                f" --output-dir {output_dir}"
+            ),
+            "note": "The merged tldr is a concatenation; rewrite it for coherence.",
+        }
+
     prep_file = output_dir / "prep.json"
     prep_file.write_text(json.dumps(prep, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -831,11 +1052,21 @@ def main():
     print(f"  2. Read the transcript: {full_path}")
     if len(chunks) > 1:
         print(f"  3. Run PASS1 on each of {len(chunks)} chunks (chunks/chunk_NN.txt).")
-        print(f"  4. Merge chunk outlines into one outline.json (see chunking.md).")
+        print(f"     Save each as {output_dir}/chunk_outline_00.json, chunk_outline_01.json, etc.")
+        print(f"  4. Merge chunk outlines automatically:")
+        print(f"     python scripts/prepare.py --merge-chunks {output_dir}/chunk_outline_*.json --output-dir {output_dir}")
+        print(f"     Then rewrite the merged tldr for coherence.")
         print(f"  5. Run PASS2 on the full transcript (or chunked, if too long).")
     else:
         print(f"  3. Run PASS1 on the full transcript → save as outline.json")
         print(f"  4. Run PASS2 on the full transcript → save as insights.md")
+    if pass2_strategy == "chunked":
+        print(f"  ⚠️  PASS2 strategy='{pass2_strategy}': split transcript into ~{pass2_tokens_per_chunk:,}-token chunks for PASS2,")
+        print(f"     then select/merge the best insights. Do NOT feed the full transcript at once.")
+    elif pass2_strategy == "reduce_and_rechunk":
+        print(f"  ⚠️  PASS2 strategy='{pass2_strategy}': transcript is very long ({full_tokens:,} tokens).")
+        print(f"     Re-chunk with smaller windows (~{pass2_tokens_per_chunk:,} tokens) for PASS2.")
+        print(f"     Consider rerunning: prepare.py ... --chunk-target 15000")
     print(f"  • Use output_language='{output_language}' (matches detected speech).")
     print(f"  • Save outputs to: {output_dir}/outline.json  and  {output_dir}/insights.md")
     print(f"")

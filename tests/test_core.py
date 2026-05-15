@@ -15,8 +15,13 @@ if SCRIPTS_DIR not in sys.path:
 
 import pytest
 from unittest.mock import patch
-from prepare import estimate_tokens, _cjk_ratio, chunk_segments, format_segment, fmt_timestamp, validate_audio_file
-from render import validate_outline, validate_inputs, validate_timestamps, ts_to_seconds, fmt_date, detect_language
+from prepare import (estimate_tokens, _cjk_ratio, chunk_segments, format_segment,
+                     fmt_timestamp, validate_audio_file, compute_section_range,
+                     merge_chunk_outlines, _title_word_overlap,
+                     PASS2_FULL_THRESHOLD, PASS2_CHUNKED_THRESHOLD)
+from render import (validate_outline, validate_inputs, validate_timestamps,
+                    ts_to_seconds, fmt_date, detect_language,
+                    _md_to_html_with_timestamps, _parse_insights_sections)
 
 
 # ==================== estimate_tokens ====================
@@ -434,3 +439,334 @@ class TestAudioUrl:
         html = render_html_dashboard(prep["metadata"], outline, insights,
                                       audio_url, prep["metadata"]["webpage_url"])
         assert "https://cdn.example.com/episode1.mp3" in html
+
+
+# ==================== Issue 4: merge_chunk_outlines ====================
+
+class TestTitleWordOverlap:
+    def test_identical_titles(self):
+        assert _title_word_overlap("Intro to AI", "Intro to AI") == 1.0
+
+    def test_no_overlap(self):
+        assert _title_word_overlap("Alpha Beta", "Gamma Delta") == 0.0
+
+    def test_partial_overlap(self):
+        overlap = _title_word_overlap("Discuss AI safety", "Discuss AI alignment")
+        # 2 common words ("discuss", "ai") out of 3 min-set = 0.667
+        assert 0.6 < overlap < 0.7
+
+    def test_empty_title(self):
+        assert _title_word_overlap("", "hello") == 0.0
+        assert _title_word_overlap("hello", "") == 0.0
+
+
+class TestMergeChunkOutlines:
+    def _chunk(self, tldr, sections, branches=None, terms=None):
+        return {
+            "tldr": tldr,
+            "outline": sections,
+            "mindmap": {
+                "root": "Topic",
+                "branches": branches or [
+                    {"label": "Branch A", "children": [{"label": "child1", "timestamp": "01:00"}]}
+                ],
+            },
+            "key_terms": terms or [],
+        }
+
+    def test_single_chunk_returns_as_is(self):
+        c = self._chunk("Summary", [{"section": "Intro", "key_points": ["pt1"]}])
+        result = merge_chunk_outlines([c])
+        assert result is c
+
+    def test_empty_list_raises(self):
+        with pytest.raises(ValueError):
+            merge_chunk_outlines([])
+
+    def test_tldr_concatenated(self):
+        c1 = self._chunk("Part 1 summary", [{"section": "S1", "key_points": ["p"]}])
+        c2 = self._chunk("Part 2 summary", [{"section": "S2", "key_points": ["p"]}])
+        result = merge_chunk_outlines([c1, c2])
+        assert "Part 1 summary" in result["tldr"]
+        assert "Part 2 summary" in result["tldr"]
+        assert " | " in result["tldr"]
+
+    def test_outline_sections_concatenated(self):
+        c1 = self._chunk("T1", [{"section": "Intro", "key_points": ["p1"]}])
+        c2 = self._chunk("T2", [{"section": "Deep Dive", "key_points": ["p2"]}])
+        result = merge_chunk_outlines([c1, c2])
+        assert len(result["outline"]) == 2
+        assert result["outline"][0]["section"] == "Intro"
+        assert result["outline"][1]["section"] == "Deep Dive"
+
+    def test_outline_dedup_similar_consecutive_sections(self):
+        c1 = self._chunk("T1", [
+            {"section": "Discuss AI safety measures", "key_points": ["p1", "p2", "p3"]},
+        ])
+        c2 = self._chunk("T2", [
+            {"section": "Discuss AI safety measures", "key_points": ["p4"]},
+        ])
+        result = merge_chunk_outlines([c1, c2])
+        # Should keep the one with more key_points (c1's version)
+        assert len(result["outline"]) == 1
+        assert len(result["outline"][0]["key_points"]) == 3
+
+    def test_mindmap_branches_merged_by_label(self):
+        c1 = self._chunk("T1", [{"section": "S1", "key_points": ["p"]}],
+                          branches=[{"label": "AI", "children": [{"label": "GPT", "timestamp": "01:00"}]}])
+        c2 = self._chunk("T2", [{"section": "S2", "key_points": ["p"]}],
+                          branches=[{"label": "AI", "children": [{"label": "Claude", "timestamp": "02:00"}]}])
+        result = merge_chunk_outlines([c1, c2])
+        ai_branch = [b for b in result["mindmap"]["branches"] if b["label"] == "AI"]
+        assert len(ai_branch) == 1
+        child_labels = {ch["label"] for ch in ai_branch[0]["children"]}
+        assert "GPT" in child_labels
+        assert "Claude" in child_labels
+
+    def test_mindmap_branches_capped_at_8(self):
+        branches = [{"label": f"Branch{i}", "children": [{"label": "c", "timestamp": "00:00"}]}
+                    for i in range(10)]
+        c1 = self._chunk("T1", [{"section": "S", "key_points": ["p"]}], branches=branches[:5])
+        c2 = self._chunk("T2", [{"section": "S2", "key_points": ["p"]}], branches=branches[5:])
+        result = merge_chunk_outlines([c1, c2])
+        assert len(result["mindmap"]["branches"]) <= 8
+
+    def test_key_terms_dedup_keeps_longest_explanation(self):
+        c1 = self._chunk("T1", [{"section": "S", "key_points": ["p"]}],
+                          terms=[{"term": "LLM", "translation": "大模型", "explanation": "short"}])
+        c2 = self._chunk("T2", [{"section": "S2", "key_points": ["p"]}],
+                          terms=[{"term": "LLM", "translation": "大语言模型",
+                                  "explanation": "Large Language Model used in this context for AI inference"}])
+        result = merge_chunk_outlines([c1, c2])
+        llm_terms = [t for t in result["key_terms"] if t["term"] == "LLM"]
+        assert len(llm_terms) == 1
+        assert "Large Language Model" in llm_terms[0]["explanation"]
+        # Also keeps the longer translation
+        assert llm_terms[0]["translation"] == "大语言模型"
+
+    def test_mindmap_string_passthrough(self):
+        """When first chunk's mindmap is a raw Mermaid string, use it as-is."""
+        c1 = self._chunk("T1", [{"section": "S", "key_points": ["p"]}])
+        c1["mindmap"] = "mindmap\n  root((Topic))"
+        c2 = self._chunk("T2", [{"section": "S2", "key_points": ["p"]}])
+        result = merge_chunk_outlines([c1, c2])
+        assert isinstance(result["mindmap"], str)
+        assert "root((Topic))" in result["mindmap"]
+
+
+# ==================== Issue 5: PASS2 strategy thresholds ====================
+
+class TestPass2StrategyThresholds:
+    """Verify the threshold constants make sense."""
+
+    def test_full_threshold_less_than_chunked(self):
+        assert PASS2_FULL_THRESHOLD < PASS2_CHUNKED_THRESHOLD
+
+    def test_full_threshold_200k(self):
+        assert PASS2_FULL_THRESHOLD == 200_000
+
+    def test_chunked_threshold_500k(self):
+        assert PASS2_CHUNKED_THRESHOLD == 500_000
+
+
+# ==================== Issue 7: compute_section_range ====================
+
+class TestComputeSectionRange:
+    def test_very_short_podcast(self):
+        # < 5 min = 2-4
+        assert compute_section_range(180, 0) == "2-4"
+
+    def test_short_podcast(self):
+        # 5-30 min = 3-7
+        assert compute_section_range(600, 0) == "3-7"
+
+    def test_normal_podcast(self):
+        # 30-90 min = 5-12
+        assert compute_section_range(3600, 0) == "5-12"
+
+    def test_long_podcast(self):
+        # > 90 min = 8-18
+        assert compute_section_range(7200, 0) == "8-18"
+
+    def test_boundary_5min(self):
+        assert compute_section_range(299, 0) == "2-4"
+        assert compute_section_range(300, 0) == "3-7"
+
+    def test_boundary_30min(self):
+        assert compute_section_range(1799, 0) == "3-7"
+        assert compute_section_range(1800, 0) == "5-12"
+
+    def test_boundary_90min(self):
+        assert compute_section_range(5399, 0) == "5-12"
+        assert compute_section_range(5400, 0) == "8-18"
+
+    def test_fallback_to_tokens_when_no_duration(self):
+        # 0 duration, 1000 tokens ≈ 2 min → 2-4
+        assert compute_section_range(0, 1000) == "2-4"
+        # 0 duration, 25000 tokens ≈ 50 min → 5-12
+        assert compute_section_range(0, 25000) == "5-12"
+
+    def test_zero_duration_zero_tokens(self):
+        # Falls back to est_minutes=30 → 5-12
+        assert compute_section_range(0, 0) == "5-12"
+
+
+# ==================== Issue 8: _md_to_html_with_timestamps ====================
+
+class TestMdToHtmlWithTimestamps:
+    """Test the upgraded MD→HTML parser."""
+
+    def test_fenced_code_block(self):
+        md = "```python\nprint('hello')\n```"
+        html = _md_to_html_with_timestamps(md)
+        assert '<pre><code class="language-python">' in html
+        assert "print(" in html
+        assert "</code></pre>" in html
+
+    def test_code_block_no_language(self):
+        md = "```\nsome code\n```"
+        html = _md_to_html_with_timestamps(md)
+        assert "<pre><code>" in html
+        assert "some code" in html
+
+    def test_code_block_escapes_html(self):
+        md = "```\n<script>alert('xss')</script>\n```"
+        html = _md_to_html_with_timestamps(md)
+        assert "&lt;script&gt;" in html
+        assert "<script>" not in html
+
+    def test_code_block_no_timestamp_linkification(self):
+        md = "```\n[05:30] this is code\n```"
+        html = _md_to_html_with_timestamps(md)
+        assert 'data-time' not in html
+        assert "[05:30]" in html
+
+    def test_simple_table(self):
+        md = "| Term | Meaning |\n|---|---|\n| LLM | Large Model |\n| RAG | Retrieval |"
+        html = _md_to_html_with_timestamps(md)
+        assert "<table>" in html
+        assert "<thead>" in html
+        assert "<tbody>" in html
+        assert "<th>Term</th>" in html
+        assert "<td>LLM</td>" in html
+        assert "</table>" in html
+
+    def test_table_html_escapes_cells(self):
+        md = "| Key | Value |\n|---|---|\n| a<b | c>d |"
+        html = _md_to_html_with_timestamps(md)
+        assert "&lt;b" in html
+        assert "c&gt;d" in html
+
+    def test_nested_list_two_levels(self):
+        md = "- Item 1\n  - Sub item A\n  - Sub item B\n- Item 2"
+        html = _md_to_html_with_timestamps(md)
+        # Should have nested <ul>
+        assert html.count("<ul>") >= 2
+        assert "Sub item A" in html
+        assert "Item 2" in html
+
+    def test_flat_list_preserved(self):
+        md = "- Alpha\n- Beta\n- Gamma"
+        html = _md_to_html_with_timestamps(md)
+        assert "<ul>" in html
+        assert "<li>" in html
+        assert "Alpha" in html
+        assert "Beta" in html
+        assert "Gamma" in html
+
+    def test_bold_in_list(self):
+        md = "- **Key point**: details here"
+        html = _md_to_html_with_timestamps(md)
+        assert "<strong>Key point</strong>" in html
+
+    def test_timestamp_linkification(self):
+        md = "See [05:30] for details"
+        html = _md_to_html_with_timestamps(md)
+        assert 'data-time="330"' in html
+        assert "05:30" in html
+
+    def test_h2_header(self):
+        md = "## Section Title"
+        html = _md_to_html_with_timestamps(md)
+        assert "<h2>Section Title</h2>" in html
+
+    def test_h3_header(self):
+        md = "### Sub Section"
+        html = _md_to_html_with_timestamps(md)
+        assert "<h3>Sub Section</h3>" in html
+
+    def test_blockquote(self):
+        md = "> This is a quote\n> With **bold**"
+        html = _md_to_html_with_timestamps(md)
+        assert "<blockquote>" in html
+        assert "<strong>bold</strong>" in html
+
+    def test_mixed_content(self):
+        """Test a realistic insights.md snippet with multiple element types."""
+        md = """## Quotes
+
+> 「This is a great quote」
+>
+> — Speaker, [01:23:45]
+
+- **Point 1**: something
+- **Point 2**: another thing
+
+```
+code example
+```
+
+| Col A | Col B |
+|---|---|
+| val1 | val2 |"""
+        html = _md_to_html_with_timestamps(md)
+        assert "<h2>" in html
+        assert "<blockquote>" in html
+        assert "<li>" in html
+        assert "<pre><code>" in html
+        assert "<table>" in html
+
+    def test_unclosed_code_block_handled(self):
+        md = "```\nunclosed code block"
+        html = _md_to_html_with_timestamps(md)
+        assert "</code></pre>" in html
+
+
+# ==================== Issue 3 (from prior session): _parse_insights_sections ====================
+
+class TestParseInsightsSections:
+    def test_chinese_headers(self):
+        md = "## 一、金句\nquote1\n\n## 二、反共识观点\ncontra1\n\n## 三、灵感钩子\nhook1"
+        result = _parse_insights_sections(md)
+        assert "quote1" in result["quotes"]
+        assert "contra1" in result["contrarian"]
+        assert "hook1" in result["hooks"]
+
+    def test_english_headers(self):
+        md = "## Quotes\nquote1\n\n## Contrarian Takes\ncontra1\n\n## Inspiration Hooks\nhook1"
+        result = _parse_insights_sections(md)
+        assert "quote1" in result["quotes"]
+        assert "contra1" in result["contrarian"]
+        assert "hook1" in result["hooks"]
+
+    def test_variant_headers_tolerated(self):
+        md = "## Quotable Moments\nquote1\n\n## contrarian ideas\ncontra1\n\n## inspiration\nhook1"
+        result = _parse_insights_sections(md)
+        assert "quote1" in result["quotes"]
+        assert "contra1" in result["contrarian"]
+        assert "hook1" in result["hooks"]
+
+    def test_unrecognized_header_warns(self, capsys):
+        md = "## Random Header\ncontent\n\n## Quotes\nquote1"
+        result = _parse_insights_sections(md)
+        # Unrecognized header content should NOT appear in any section
+        assert "content" not in result["quotes"]
+        assert "content" not in result["contrarian"]
+        assert "content" not in result["hooks"]
+        # Warning should be printed to stderr
+        captured = capsys.readouterr()
+        assert "Random Header" in captured.err
+
+    def test_empty_input(self):
+        result = _parse_insights_sections("")
+        assert result == {"quotes": "", "contrarian": "", "hooks": ""}
